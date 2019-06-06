@@ -65,7 +65,7 @@ def get_vocab_index(vocab_size,data):
     except:
         # generate overall vocab index if it doesn't exist
         try:
-            with open(vocab_filename,'r') as f:
+            with open(vocab_filename,'rb') as f:
                 vocab=pickle.load(f)
         except:
             import os
@@ -80,16 +80,18 @@ def get_vocab_index(vocab_size,data):
                 mkVocabPickle(data+'/'+file,vocabfile)
                 vocabfiles.append(vocabfile)
             mergeVocabPickles(vocabfiles,vocab_filename)
-            with open(vocab_filename,'r') as f:
+            with open(vocab_filename,'rb') as f:
                 vocab=pickle.load(f)
 
         # trim overall vocab index to appropriate size
         vocab_top=vocab.most_common(vocab_size-1)
         vocab_top.append(('<<UNK>>',1))
-        with open(vocab_top_filename,'w') as f:
+        with open(vocab_top_filename,'wb') as f:
             pickle.dump(vocab_top,f)
-    vocab_words=map(lambda (x,y): x.encode('unicode_escape').decode('unicode_escape'),vocab_top)
-    vocab_counts=map(lambda (x,y): y,vocab_top)
+    vocab_words=[x.encode('unicode_escape').decode('unicode_escape') for x,y in vocab_top]
+    vocab_counts=[y for x,y in vocab_top]
+    #vocab_words=map(lambda x,y: x.encode('unicode_escape').decode('unicode_escape'),vocab_top)
+    #vocab_counts=map(lambda x,y: y,vocab_top)
     return (tf.contrib.lookup.index_table_from_tensor(
         vocab_words,
         default_value=vocab_size-1,
@@ -125,7 +127,7 @@ def mkVocabPickle(datafile,vocabfile):
             vocab.update(tokens)
 
     # save output
-    with open(vocabfile,'w') as f:
+    with open(vocabfile,'wb') as f:
         pickle.dump(vocab,f)
 
 def mergeVocabPickles(vocabfiles,outfile):
@@ -133,10 +135,10 @@ def mergeVocabPickles(vocabfiles,outfile):
     vocabs=[]
     for filename in vocabfiles:
         print('  ',filename)
-        with open(filename,'r') as f:
+        with open(filename,'rb') as f:
             vocabs.append(pickle.load(f))
 
     from functools import reduce
     sum_vocabs=reduce(lambda x,y:x+y,vocabs)
-    with open(outfile,'w') as f:
+    with open(outfile,'wb') as f:
         pickle.dump(sum_vocabs,f)

@@ -9,6 +9,7 @@ import model.train
 parser=argparse.ArgumentParser('PROG', usage='%(prog)s [options]')
 parser.add_argument('--output_dir',type=str,default=None)
 parser.add_argument('--save_summary_steps',type=int,default=100)
+parser.add_argument('--steps',type=int,default=None)
 parser.add_argument('--seed',type=int,default=0)
 model.train.modify_parser(parser)
 args = parser.parse_args()
@@ -39,6 +40,7 @@ estimator=tf.estimator.Estimator(
     )
 
 estimator.train(
-    input_fn=lambda: model.train.input_fn(args)
+    input_fn=lambda: model.train.input_fn(args),
+    steps=args.steps,
     )
 
