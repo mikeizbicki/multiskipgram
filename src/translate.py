@@ -1,6 +1,7 @@
 #!/bin/python
 
 from __future__ import print_function
+from __future__ import absolute_import
 
 ########################################
 import argparse
@@ -11,13 +12,9 @@ parser.add_argument('--source_words',type=str,required=True)
 args = parser.parse_args()
 
 with open(args.model_dir+'/args.json','r') as f:
-    import simplejson as json
+    import json 
     data=json.loads(f.readline())
     args_train=type('',(),data)
-    #try:
-        #args_train.data
-    #except:
-        #args_train.data='data/escrawl'
 
 ########################################
 print('loading tensorflow')

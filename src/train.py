@@ -20,7 +20,7 @@ if args.output_dir is not None:
         os.makedirs(args.output_dir)
     except:
         pass
-    import simplejson as json
+    import json
     args_str=json.dumps(vars(args))
     with open(args.output_dir+'/args.json','w') as f:
         f.write(args_str)

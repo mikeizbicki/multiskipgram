@@ -12,12 +12,14 @@ def modify_parser(parser):
     group = parser.add_argument_group('optimization options')
     group.add_argument('--batch_size',type=int,default=128)
     group.add_argument('--optimizer',type=str,choices=['adam','sgd'],default='sgd')
-    group.add_argument('--learning_rate',type=float,default=0.1)
+    group.add_argument('--learning_rate',type=float,default=0.25)
     group.add_argument('--learning_rate_decay',type=float,default=1e8)
     group.add_argument('--nce_samples',type=int,default=2**8)
     group.add_argument('--sampler',type=str,choices=['log_uniform','fixed_unigram'],default='fixed_unigram')
     group.add_argument('--reg',type=float,default=0.0)
-    group.add_argument('--outputs_method',type=str,choices=['averaged','per_label'],default='per_label')
+    group.add_argument('--outputs_method',type=str,choices=['averaged','per_label'],default='averaged')
+    group.add_argument('--zero_init',type=str,choices=['inputs','outputs'],nargs='*',default=[])
+    group.add_argument('--f0mod',type=str,choices=['true','false'],default='false')
 
     group = parser.add_argument_group('data pipeline options')
     group.add_argument('--data',type=str,required=True)
@@ -27,7 +29,7 @@ def modify_parser(parser):
     group.add_argument('--shuffle_seed',type=int,default=0)
     group.add_argument('--context_size',type=int,default=5)
     group.add_argument('--threshold_base',type=float,default=20.0)
-    group.add_argument('--dp_type',type=str,choices=['word_pair','word_context'],default='word_pair')
+    group.add_argument('--dp_type',type=str,choices=['word_pair','word_context','sentence'],default='word_pair')
 
     group = parser.add_argument_group('data pipeline options (debug)')
     group.add_argument('--parallel_map',type=int,default=1)
@@ -57,10 +59,11 @@ def macro_input_variables(params):
 
     # create vocab hash
     vocab_index,vocab_words,vocab_counts=model.common.get_vocab_index(params.vocab_size,params.data)
+    vocab_size=len(vocab_counts)
     f_globals['vocab_index']=vocab_index
     f_globals['vocab_words']=vocab_words
     f_globals['vocab_counts']=vocab_counts
-    f_globals['vocab_size']=len(vocab_counts)
+    f_globals['vocab_size']=vocab_size
 
     with tf.variable_scope('input_pipeline',reuse=tf.AUTO_REUSE):
 
@@ -187,27 +190,11 @@ def input_fn(params):
             word_freq,
             family='progress'
             )
-        #NOTE: The 'progress_axis_XXX' summaries below don't contain any information
-        # not already contained in the 'progress' summaries.
-        #for axis in range(num_axes):
-            #for i in [1,10,100,1000,10000,100000]:
-                #tf.summary.scalar(
-                    #'words_seen_'+str(i),
-                    #tf.count_nonzero(tf.maximum(tf.zeros([],dtype=tf.int64),word_counts-i+1)),
-                    #family='progress_axis_'+str(axis),
-                    #)
-            #label_freq=tf.cast(num_words_axis[axis],tf.float32)/tf.cast(1+num_words,tf.float32)
-            #tf.summary.histogram(
-                #'label_freq',
-                #label_freq,
-                #family='progress_axis_'+str(axis),
-                #)
-
 
         # convert string into skipgram input
         SKIPGRAM_PAD=-2
         #SKIPGRAM_PAD='PAD'
-        def line2wordpairs(line,labels):
+        def line2wordpairs(line,label):
             global word_counts
             global word_counts_axis
             global num_lines
@@ -232,8 +219,8 @@ def input_fn(params):
                     t=params.threshold_base/params.vocab_size
                     freqs=[]
                     for axis in range(num_axes):
-                        numerator=tf.gather(word_counts_axis[axis][:,labels[axis]],tokens_ids)
-                        denominator=num_words_axis[axis][labels[axis]]
+                        numerator=tf.gather(word_counts_axis[axis][:,label[axis]],tokens_ids)
+                        denominator=num_words_axis[axis][label[axis]]
                         freqs.append(tf.cast(numerator,tf.float32)/tf.cast(denominator,tf.float32))
                     freq=tf.reduce_min(freqs)
                 keep_prob=tf.sqrt(t/freq)
@@ -247,22 +234,18 @@ def input_fn(params):
                         )
                 tokens_filtered=tf.boolean_mask(tokens_ids,filter_mask)
 
-            # create word_context
-            if params.dp_type=='word_context':
+            # convert tokens into dp_type
+            if params.dp_type=='sentence':
+                raise ValueError('dp_type==sentence not yet implemented')
+
+            elif params.dp_type=='word_context':
                 words=tf.expand_dims(tokens_filtered,axis=1)
                 context=tf.stack([
                     tf.manip.roll(tokens_filtered,i,0)
                     for i in
                     list(range(-params.context_size,0))+list(range(1,params.context_size+1))
                     ],axis=1)
-                #print('words=',words)
-                #print('context=',context)
 
-                # FIXME: add filtering?
-                words_filtered=words
-                context_filtered=context
-
-            # create word pairs
             elif params.dp_type=='word_pair':
                 tokens_padded=tf.pad(
                     tokens_filtered,
@@ -281,8 +264,8 @@ def input_fn(params):
                     tf.not_equal(context,SKIPGRAM_PAD),
                     tf.not_equal(words,SKIPGRAM_PAD),
                     )
-                context_filtered=tf.expand_dims(tf.boolean_mask(context,ids),axis=1)
-                words_filtered=tf.expand_dims(tf.boolean_mask(words,ids),axis=1)
+                context=tf.expand_dims(tf.boolean_mask(context,ids),axis=1)
+                words=tf.expand_dims(tf.boolean_mask(words,ids),axis=1)
 
             # update all variable counters
             if params.word_counts=='none':
@@ -305,11 +288,11 @@ def input_fn(params):
                 update_axis=[]
                 if params.word_counts=='all':
                     for axis in range(num_axes):
-                        labels_tiled=tf.tile(
-                            tf.reshape(labels[axis],[1]),
+                        label_tiled=tf.tile(
+                            tf.reshape(label[axis],[1]),
                             [tf.size(tokens_ids)],
                             )
-                        indices=tf.stack([tokens_ids,labels_tiled],axis=1)
+                        indices=tf.stack([tokens_ids,label_tiled],axis=1)
                         word_counts_axis_old=tf.gather_nd(word_counts_axis[axis],indices)
                         update_axis.append(tf.scatter_nd_update(
                             word_counts_axis[axis],
@@ -318,19 +301,27 @@ def input_fn(params):
                             ))
                         update_axis.append(tf.scatter_add(
                             num_words_axis[axis],
-                            tf.expand_dims(labels[axis],axis=0),
+                            tf.expand_dims(label[axis],axis=0),
                             tf.size(tokens,out_type=tf.int64)
                             ))
                 update_ops=[update_num_lines,update_num_words,update_word_counts]+update_axis
 
             with tf.control_dependencies(update_ops):
-                return (context_filtered,words_filtered,labels)
+                labels=tf.tile(tf.expand_dims(label,axis=0),[tf.shape(words)[0],1])
+                features={
+                    'words':words,
+                    'context':context,
+                    'labels':labels
+                    }
+                return features
 
         dataset=dataset.map(line2wordpairs,num_parallel_calls=params.parallel_map)
-        dataset=dataset.flat_map(lambda x,y,z:tf.data.Dataset.zip((
-            tf.data.Dataset.from_tensor_slices(tf.concat([x,y],axis=1)),
-            tf.data.Dataset.from_tensors(z).repeat(),
-            )))
+        dataset=dataset.flat_map(lambda *xs: tf.data.Dataset.zip(tuple(tf.data.Dataset.from_tensor_slices(x) for x in xs)))
+        dataset=tf.data.Dataset.zip((dataset,tf.data.Dataset.from_tensors(1).repeat()))
+        #dataset=dataset.flat_map(lambda x,y,z:tf.data.Dataset.zip((
+            #tf.data.Dataset.from_tensor_slices(tf.concat([x,y],axis=1)),
+            #tf.data.Dataset.from_tensors(z).repeat(),
+            #)))
 
         # finalize dataset
         dataset=dataset.shuffle(params.shuffle_words,seed=params.shuffle_seed)
@@ -369,59 +360,23 @@ def macro_model_variables(params):
         num_embeddings = [1 for axis in range(num_axes)]
     f_globals['num_embeddings']=num_embeddings
 
-    def my_get_variable(name,shape):
-        if params.init_from_checkpoint is not None:
-            #import numpy as np
-            from tensorflow.python import pywrap_tensorflow
-            latest_ckp = tf.train.latest_checkpoint(params.init_from_checkpoint)
-            reader = pywrap_tensorflow.NewCheckpointReader(latest_ckp)
-            var_to_shape_map = reader.get_variable_to_shape_map()
-            #var=reader.get_tensor('model/'+name)
-            #for axis in range(len(var.shape)):
-                #s1=var.shape[axis]
-                #s2=shape[axis]
-                #if not s1 == s2:
-                    ##proj=np.random.randn(s1,s2)
-                    #proj=np.ones([s1,s2])
-                    #proj_norm=np.linalg.norm(proj,ord='fro')
-                    #proj/=proj_norm
-                    #var=np.tensordot(
-                        #var,
-                        #proj,
-                        #axes=[[axis],[0]]
-                        #)
-                    # FIXME: if num_axes>1, do we need to do a transpose here?
-            with tf.variable_scope('old'):
-                oldshape=var_to_shape_map['model/'+name]
-                old=tf.get_local_variable(name=name,shape=oldshape)
-                #init=old.initialized_value()
-                init=old.initial_value
-                for axis in range(len(shape)):
-                    if not oldshape[axis]==shape[axis]:
-                        proj=tf.ones([oldshape[axis],shape[axis]])/tf.cast(oldshape[axis]*shape[axis],tf.float32)
-                        init=tf.tensordot(
-                            init,
-                            proj,
-                            axes=[[axis],[0]]
-                            )
-                        permutation=range(0,axis)+[len(shape)-1]+range(axis,len(shape)-1)
-                        init=tf.transpose(init,permutation)
-
-            return tf.get_variable(
-                name=name,
-                initializer=init, #.initialized_value(),
-                )
-        else:
-            return tf.get_variable(
-                name=name,
-                shape=shape
-                )
-
-
     with tf.variable_scope('model',reuse=tf.AUTO_REUSE):
         def make_embedding(embedding):
+
+            def my_get_variable(name,shape):
+                if embedding in params.zero_init:
+                    return tf.get_variable(
+                        name=name,
+                        initializer=tf.zeros(shape),
+                        )
+                else:
+                    return tf.get_variable(
+                        name=name,
+                        shape=shape,
+                        )
+
             if embedding in params.disable_multi:
-                f_globals[embedding]=tf.get_variable(
+                f_globals[embedding]=my_get_variable(
                     name=embedding,
                     shape=[vocab_size,params.embedding_size],
                     )
@@ -431,46 +386,10 @@ def macro_model_variables(params):
                     name=embedding+'_var',
                     shape=[vocab_size,params.embedding_size]+num_embeddings,
                     )
-                #if params.init_from_checkpoint is not None:
-                    #from tensorflow.python import pywrap_tensorflow
-                    #latest_ckp = tf.train.latest_checkpoint(params.init_from_checkpoint)
-                    #reader = pywrap_tensorflow.NewCheckpointReader(latest_ckp)
-                    #init_embedding_var=reader.get_tensor('model/'+embedding) #+'_var')
-                    #for axis in range(num_axes):
-                        #init_embedding_var=tf.tensordot(
-                            #init_embedding_var,
-                            #tf.ones([init_embedding_var.shape[2],num_embeddings[axis]]),
-                            #axes=[[2],[0]]
-                            #)
-                    #f_globals[embedding+'_var']=tf.get_variable(
-                        #name=embedding+'_var',
-                        #initializer=init_embedding_var
-                        #)
-                #else:
-                    #f_globals[embedding+'_var']=tf.get_variable(
-                        #name=embedding+'_var',
-                        #shape=[vocab_size,params.embedding_size]+num_embeddings,
-                        #)
 
-                # tensors that rotate the embedding_var so that the embeddings
-                # for each label are aligned
-                # FIXME: I don't know how to write these equations
+                # NOTE: this extra variable exists so that in the future it can be replaced
+                # with a rotation to align the embeddings
                 f_globals[embedding]=f_globals[embedding+'_var']
-                #if False:
-                    #f_globals[embedding+'_rotator_axis']=[]
-                    #for axis in range(num_axes):
-                        #f_globals[embedding+'_rotator_axis'].append(tf.get_variable(
-                            #name=embedding+'_rotator_axis_'+str(axis),
-                            #shape=[params.embedding_size,params.embedding_size,num_embeddings[axis]],
-                            #trainable=False
-                            #))
-                        #print('f_globals[embedding]=',f_globals[embedding])
-                        #f_globals[embedding]=tf.matmul(
-                            #tf.transpose(f_globals[embedding],[1,0,2]),
-                            #f_globals[embedding+'_rotator_axis'][axis],
-                            ##transpose_a=True
-                            #)
-                        #print('f_globals[embedding]=',f_globals[embedding])
 
                 # the factors that project from the small tensor to the full tensor
                 f_globals[embedding+'_projector_axis']=[]
@@ -480,12 +399,7 @@ def macro_model_variables(params):
                             name=embedding+'_projector_axis_'+str(axis),
                             shape=[num_embeddings[axis],labels_num[axis]],
                             ))
-                        #f_globals[embedding+'_projector_axis'].append(tf.get_variable(
-                            #name=embedding+'_projector_axis_'+str(axis),
-                            #shape=[num_embeddings[axis],labels_num[axis]],
-                            #))
                     else:
-                        #f_globals[embedding+'_projector_axis'].append(None)
                         f_globals[embedding+'_projector_axis'].append(tf.get_variable(
                             name=embedding+'_projector_axis_'+str(axis),
                             initializer=tf.ones([num_embeddings[axis],labels_num[axis]]),
@@ -514,27 +428,20 @@ def model_fn(
 
     # create loss
     with tf.variable_scope('loss'):
-        f0=features[:,:1]
-        f0_size=4
-        f0=tf.tile(f0,[1,f0_size])
-
-        f1=features[:,1:]
+        features=features[0]
+        labels=features['labels'] # FIXME: `labels` should have a more descriptive name
+        f0=features['words']
+        f1=features['context']
+        f0_size=f0.get_shape()[1]
         f1_size=f1.get_shape()[1]
-
-        batch_size=features.get_shape()[0]
 
         # create negative samples
         nce_samples=min(params.nce_samples,vocab_size)
-        if params.outputs_method=='per_dp':
-            num_sampled=[batch_size,num_sampled]#FIXME: check
-        else:
-            num_sampled=nce_samples
-
         if params.sampler=='log_uniform':
             sampled_values=tf.nn.log_uniform_candidate_sampler(
                 true_classes=f1,
                 num_true=f1_size,
-                num_sampled=num_sampled,
+                num_sampled=nce_samples,
                 unique=False,
                 range_max=vocab_size,
             )
@@ -542,7 +449,7 @@ def model_fn(
             sampled_values=tf.nn.fixed_unigram_candidate_sampler(
                 true_classes=f1,
                 num_true=f1_size,
-                num_sampled=num_sampled,
+                num_sampled=nce_samples,
                 unique=False,
                 range_max=vocab_size,
                 unigrams=[x+1 for x in vocab_counts],
@@ -591,19 +498,17 @@ def model_fn(
         assert_shape(inputs_f0_label,[None,f0_size,params.embedding_size])
         assert_shape(outputs_f1_label,[None,f1_size,params.embedding_size])
 
+        if params.f0mod=='true':
+            inputs_f0_label=tf.expand_dims(tf.reduce_mean(inputs_f0_label,axis=1),axis=1)
+            f0_size=1
+
         inputs_f0_label_reshape=tf.reshape(inputs_f0_label,[-1,f0_size,1,params.embedding_size])
         outputs_f1_label_reshape=tf.reshape(outputs_f1_label,[-1,1,f1_size,params.embedding_size])
 
-        if f0_size==1:
-            # FIXME: is _sum_rows faster?
-            #logits1=_sum_rows(inputs_f0_label*outputs_f1_label)
-            #logits1=tf.expand_dims(logits1,axis=1)
-            logits1=tf.reduce_sum(inputs_f0_label_reshape*outputs_f1_label_reshape,axis=3)
-        else:
-            logits1_per_f0=[]
-            for i in range(f0_size):
-                logits1_per_f0.append(tf.reduce_sum(inputs_f0_label_reshape[:,i:i+1,0:1,:]*outputs_f1_label_reshape,axis=3))
-            logits1=tf.concat(logits1_per_f0,axis=1)
+        logits1_per_f0=[]
+        for i in range(f0_size):
+            logits1_per_f0.append(tf.reduce_sum(inputs_f0_label_reshape[:,i:i+1,0:1,:]*outputs_f1_label_reshape,axis=3))
+        logits1=tf.concat(logits1_per_f0,axis=1)
         logits1-=tf.log(tf.reshape(true_expected_count,[-1,1,f1_size]))
         assert_shape(logits1,[None,f0_size,f1_size])
 
@@ -615,6 +520,7 @@ def model_fn(
             assert_shape(logits2,[None,f0_size,nce_samples])
 
         else:
+
             # FIXME: what is the best outputs_method?
             if params.outputs_method=='averaged':
                 outputs_sampled=tf.gather(outputs,vocab_sampled)
@@ -633,12 +539,12 @@ def model_fn(
                         [[2],[0]]
                         )
                 outputs_trans=tf.transpose(outputs_sampled,list(range(2,2+num_axes))+[0,1])
-                outputs_labels=tf.gather_nd(outputs_trans,labels)
                 print('outputs_sampled=',outputs_sampled)
                 print('outputs_trans=',outputs_trans)
-                print('outputs_labels=',outputs_labels)
                 print('inputs_f0_label=',inputs_f0_label)
                 print('labels=',labels)
+                outputs_labels=tf.gather_nd(outputs_trans,labels)
+                print('outputs_labels=',outputs_labels)
                 outputs_labels_reshape=tf.reshape(outputs_labels,[-1,1,nce_samples,params.embedding_size])
                 inputs_f0_label_reshape=tf.reshape(inputs_f0_label,[-1,f0_size,1,params.embedding_size])
                 logits2=tf.reduce_sum(inputs_f0_label_reshape*outputs_labels_reshape,axis=3)
@@ -647,10 +553,7 @@ def model_fn(
 
         assert_shape(logits2,[None,f0_size,nce_samples])
 
-
         # calculate loss
-        print('logits1=',logits1)
-        print('logits2=',logits2)
         logits1=tf.reshape(logits1,[-1,f0_size*f1_size])
         logits2=tf.reshape(logits2,[-1,f0_size*nce_samples])
         logits=tf.concat([logits1,logits2],axis=1)
@@ -663,7 +566,7 @@ def model_fn(
             logits=logits,
             name="sampled_losses"
             )
-        loss_per_dp=_sum_rows(sampled_losses)/f0_size
+        loss_per_dp=_sum_rows(sampled_losses)/tf.cast(f0_size,tf.float32)
         loss=tf.reduce_mean(loss_per_dp)
 
     # create regularization term
@@ -723,7 +626,8 @@ def assert_shape(tensor,shape):
     For implementation details, see:
     https://stackoverflow.com/questions/34175111/raise-an-exception-from-a-higher-level-a-la-warnings
     '''
-    if tensor.get_shape().as_list()==shape:
+    tshape=tensor.get_shape().as_list()
+    if tshape==shape or (shape[0] is None and tshape[1:]==shape[1:]):
         return
     else:
         import sys
@@ -737,6 +641,8 @@ def assert_shape(tensor,shape):
 ################################################################################
 
 # See: https://github.com/tensorflow/tensorflow/blob/93dd14dce2e8751bcaab0a0eb363d55eb0cc5813/tensorflow/python/ops/nn_impl.py#L1271
+# FIXME: Many reduce_sum calls above can be replaced by _sum_rows,
+# but it's not clear that the increased speed would be worth the complexity
 def _sum_rows(x):
   """Returns a vector summing up each row of the matrix x."""
   # _sum_rows(x) is equivalent to math_ops.reduce_sum(x, 1) when x is

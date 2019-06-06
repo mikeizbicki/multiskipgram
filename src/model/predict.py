@@ -18,11 +18,11 @@ def model_fn(
 
     # create vocab hash
     print('  create vocab')
-    import common
-    vocab_index,vocab_words,vocab_counts=common.get_vocab_index(args.vocab_size,args.data)
+    import model.common
+    vocab_index,vocab_words,vocab_counts=model.common.get_vocab_index(args.vocab_size,args.data)
 
     # create variables
-    labels_names=common.data2labels(args.data)
+    labels_names=model.common.data2labels(args.data)
     labels_num=[len(axis) for axis in labels_names ]
     import train
     train.macro_input_variables(args)
@@ -48,7 +48,7 @@ def model_fn(
         )
 
     # create word vectors
-    labels=common.data2labels(args.data)
+    labels=model.common.data2labels(args.data)
     axis0_source=labels[0].index('cl')
     wordvecs_source=wordvecs[:,:,axis0_source]
 
