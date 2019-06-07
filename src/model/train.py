@@ -17,7 +17,6 @@ def modify_parser(parser):
     group.add_argument('--nce_samples',type=int,default=2**8)
     group.add_argument('--sampler',type=str,choices=['log_uniform','fixed_unigram'],default='fixed_unigram')
     group.add_argument('--reg',type=float,default=0.0)
-    group.add_argument('--outputs_method',type=str,choices=['averaged','per_label'],default='averaged')
     group.add_argument('--zero_init',type=str,choices=['inputs','outputs'],nargs='*',default=[])
     group.add_argument('--f0mod',type=str,choices=['true','false'],default='false')
 
@@ -273,19 +272,19 @@ def input_fn(params):
 
             # create negative samples
             nce_samples=min(params.nce_samples,vocab_size)
-            def candidate_sampler(f1,f1_size):
+            def candidate_sampler(pos,pos_size):
                 if params.sampler=='log_uniform':
                     sampled_values=tf.nn.log_uniform_candidate_sampler(
-                        true_classes=f1,
-                        num_true=f1_size,
+                        true_classes=pos,
+                        num_true=pos_size,
                         num_sampled=nce_samples,
                         unique=False,
                         range_max=vocab_size,
                     )
                 elif params.sampler=='fixed_unigram':
                     sampled_values=tf.nn.fixed_unigram_candidate_sampler(
-                        true_classes=f1,
-                        num_true=f1_size,
+                        true_classes=pos,
+                        num_true=pos_size,
                         num_sampled=nce_samples,
                         unique=False,
                         range_max=vocab_size,
@@ -294,22 +293,22 @@ def input_fn(params):
                 return sampled_values
 
             if params.reuse_samples=='true':
-                f1=context
-                f1_size=f1.get_shape()[1]
-                sampled_values=candidate_sampler(f1,f1_size)
+                pos=context
+                pos_size=pos.get_shape()[1]
+                sampled_values=candidate_sampler(pos,pos_size)
                 samples, true_expected_count, sampled_expected_count = (
                     tf.stop_gradient(s) for s in sampled_values)
                 samples=tf.tile(tf.expand_dims(samples,dim=0),[tf.shape(words)[0],1])
-                sampled_expected_count=tf.tile(tf.expand_dims(sampled_expected_count,dim=0),[tf.shape(words)[0],nce_samples])
+                sampled_expected_count=tf.tile(tf.expand_dims(sampled_expected_count,dim=0),[tf.shape(words)[0],1])
 
             else:
                 words_size=tf.shape(words)[0]
                 context_size=context.get_shape()[1]
                 def body(a,b,c):
                     a_size=tf.shape(a)[0]
-                    f1=context[a_size:a_size+1,:]
-                    f1_size=f1.get_shape()[1]
-                    sampled_values=candidate_sampler(f1,f1_size)
+                    pos=context[a_size:a_size+1,:]
+                    pos_size=pos.get_shape()[1]
+                    sampled_values=candidate_sampler(pos,pos_size)
                     vocab_sampled, true_expected_count, sampled_expected_count = sampled_values
                     return [
                         tf.concat([a,tf.expand_dims(vocab_sampled,axis=0)],axis=0),
@@ -333,6 +332,9 @@ def input_fn(params):
                     )
                 samples, true_expected_count, sampled_expected_count = (
                     tf.stop_gradient(s) for s in sampled_values)
+
+            allsamples=tf.concat([context,samples],axis=1)
+            expected_count=tf.concat([true_expected_count,sampled_expected_count],axis=1)
 
             # update all variable counters
             if params.word_counts=='none':
@@ -375,26 +377,22 @@ def input_fn(params):
 
             with tf.control_dependencies(update_ops):
                 labels=tf.tile(tf.expand_dims(label,axis=0),[tf.shape(words)[0],1])
-                #allwords=tf.concat([words,context,samples],axis=1)
                 features={
-                    #'allwords':allwords,
                     'words':words,
-                    'context':context,
+                    'allsamples':allsamples,
                     'labels':labels,
-                    'samples':samples,
                     }
+
+                # adding expected_count to the features dict causes a slowdown,
+                # so only do it if it will be used by the estimator
                 if params.sample_method=='nce':
-                    features['true_expected_count']=true_expected_count
-                    features['sampled_expected_count']=sampled_expected_count
+                    features['expected_count']=expected_count
+
                 return features
 
         dataset=dataset.map(line2wordpairs,num_parallel_calls=params.parallel_map)
         dataset=dataset.flat_map(lambda *xs: tf.data.Dataset.zip(tuple(tf.data.Dataset.from_tensor_slices(x) for x in xs)))
         dataset=tf.data.Dataset.zip((dataset,tf.data.Dataset.from_tensors(1).repeat()))
-        #dataset=dataset.flat_map(lambda x,y,z:tf.data.Dataset.zip((
-            #tf.data.Dataset.from_tensor_slices(tf.concat([x,y],axis=1)),
-            #tf.data.Dataset.from_tensors(z).repeat(),
-            #)))
 
         # finalize dataset
         dataset=dataset.shuffle(params.shuffle_words,seed=params.shuffle_seed)
@@ -514,14 +512,15 @@ def model_fn(
         features=features[0]
         labels=features['labels'] # FIXME: `labels` should have a more descriptive name
         f0=features['words']
-        f1=features['context']
         f0_size=f0.get_shape()[1]
-        f1_size=f1.get_shape()[1]
 
-        f2=features['samples']
-        f2_size=f2.get_shape()[1]
+        samples=features['allsamples']
+        samples_size=samples.get_shape()[1]
 
-        # calculate the logits of the labels in f0 and f1
+        pos_size=params.context_size*2
+        neg_size=samples_size-pos_size
+
+        # calculate the logits of the labels in f0 and pos
         def multi2single(e,projector_axis):
             e_label=e
             for axis in range(num_axes):
@@ -553,51 +552,40 @@ def model_fn(
             inputs_f0_label=multi2single(inputs_f0,inputs_projector_axis)
 
         if 'outputs' in params.disable_multi:
-            outputs_f1_label=tf.gather(outputs,f1)
-            outputs_f2_label=tf.gather(outputs,f2)
-            bias_f1_label=tf.expand_dims(tf.gather(bias,f1),axis=1)
-            bias_f2_label=tf.expand_dims(tf.gather(bias,f2),axis=1)
+            outputs_samples_label=tf.gather(outputs,samples)
+            bias_samples_label=tf.expand_dims(tf.gather(bias,samples),axis=1)
         else:
-            outputs_f1=tf.gather(outputs,f1)
-            outputs_f2=tf.gather(outputs,f2)
-            bias_f1=tf.gather(bias,f1)
-            bias_f2=tf.gather(bias,f2)
-            assert_shape(outputs_f1,[None,f1_size,params.embedding_size]+num_embeddings)
-            assert_shape(outputs_f2,[None,f2_size,params.embedding_size]+num_embeddings)
-            outputs_f1_label=multi2single(outputs_f1,outputs_projector_axis)
-            outputs_f2_label=multi2single(outputs_f2,outputs_projector_axis)
-            bias_f1_label=tf.expand_dims(tf.squeeze(multi2single(bias_f1,outputs_projector_axis),axis=2),axis=1)
-            bias_f2_label=tf.expand_dims(tf.squeeze(multi2single(bias_f2,outputs_projector_axis),axis=2),axis=1)
+            outputs_samples=tf.gather(outputs,samples)
+            assert_shape(outputs_samples,[None,samples_size,params.embedding_size]+num_embeddings)
+            outputs_samples_label=multi2single(outputs_samples,outputs_projector_axis)
+            bias_samples=tf.gather(bias,samples)
+            bias_samples_label=tf.expand_dims(tf.squeeze(multi2single(bias_samples,outputs_projector_axis),axis=2),axis=1)
 
         assert_shape(inputs_f0_label,[None,f0_size,params.embedding_size])
-        assert_shape(outputs_f1_label,[None,f1_size,params.embedding_size])
+        assert_shape(outputs_samples_label,[None,samples_size,params.embedding_size])
 
         if params.f0mod=='true':
             inputs_f0_label=tf.expand_dims(tf.reduce_mean(inputs_f0_label,axis=1),axis=1)
             f0_size=1
 
-        logits1=tf.einsum('imk,ink->imn',inputs_f0_label,outputs_f1_label)+bias_f1_label
-        logits2=tf.einsum('imk,ink->imn',inputs_f0_label,outputs_f2_label)+bias_f2_label
+        logits=tf.einsum('imk,ink->imn',inputs_f0_label,outputs_samples_label)+bias_samples_label
         if params.sample_method=='nce':
-            logits1-=tf.log(tf.expand_dims(features['true_expected_count'],axis=1))
-            logits2-=tf.log(tf.expand_dims(features['sampled_expected_count'],axis=1))
-        assert_shape(logits1,[None,f0_size,f1_size])
-        assert_shape(logits2,[None,f0_size,f2_size])
+            logits-=tf.log(tf.expand_dims(features['expected_count'],axis=1))
+        assert_shape(logits,[None,f0_size,samples_size])
 
         # calculate loss
-        logits1=tf.reshape(logits1,[-1,f0_size*f1_size])
-        logits2=tf.reshape(logits2,[-1,f0_size*f2_size])
-        logits=tf.concat([logits1,logits2],axis=1)
+        logits1=logits[:,:,:pos_size]
+        logits2=logits[:,:,pos_size:]
         nce_labels=tf.concat(
-            [tf.ones_like(logits1)/tf.cast(f1_size,tf.float32),tf.zeros_like(logits2)],
-            axis=1,
+            [tf.ones_like(logits1)/tf.cast(pos_size,tf.float32),tf.zeros_like(logits2)],
+            axis=2,
             )
         sampled_losses = tf.nn.sigmoid_cross_entropy_with_logits(
             labels=nce_labels,
             logits=logits,
             name="sampled_losses"
             )
-        loss_per_dp=_sum_rows(sampled_losses)/tf.cast(f0_size,tf.float32)
+        loss_per_dp=tf.reduce_sum(sampled_losses,axis=[1,2])/tf.cast(f0_size,tf.float32)
         loss=tf.reduce_mean(loss_per_dp)
 
     # create regularization term
@@ -615,7 +603,7 @@ def model_fn(
                 tf.summary.scalar('reg_inputs',reg_inputs,family='optimization')
                 reg+=reg_inputs
             if not 'outputs' in params.disable_multi:
-                reg_outputs=regularize_multi(outputs_f1)
+                reg_outputs=regularize_multi(outputs_samples)
                 tf.summary.scalar('reg_outputs',reg_outputs,family='optimization')
                 reg+=reg_outputs
             reg*=params.reg

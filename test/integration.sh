@@ -29,7 +29,15 @@ rm data/test-axis2/vocab -r
 
 # run tests
 runtest $train --data=data/test-axis2 
+
 runtest $train --data=data/test-axis2 --dp_type=word_context
+runtest $train --data=data/test-axis2 --dp_type=word_pair
+
+runtest $train --data=data/test-axis2 --reuse_samples=true
+runtest $train --data=data/test-axis2 --reuse_samples=false
+
+runtest $train --data=data/test-axis2 --sample_method=nce
+runtest $train --data=data/test-axis2 --sample_method=ns
 
 runtest $train --data=data/test-axis2 --word_counts=none
 runtest $train --data=data/test-axis2 --word_counts=fast
@@ -42,5 +50,3 @@ runtest $train --data=data/test-axis2 --num_embeddings 1 2
 runtest $train --data=data/test-axis2 --num_embeddings 2 1
 runtest $train --data=data/test-axis2 --num_embeddings 2 2 --disable_multi inputs
 runtest $train --data=data/test-axis2 --num_embeddings 2 2 --disable_multi outputs
-runtest $train --data=data/test-axis2 --num_embeddings 2 2 --outputs_method averaged
-runtest $train --data=data/test-axis2 --num_embeddings 2 2 --outputs_method per_label
